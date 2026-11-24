@@ -316,7 +316,7 @@ async function processTask(id: number, config: AIConfig) {
 
       if (!isAsync && imageUrl) {
         logTaskProgress(label, 'sync-complete', { id, imageUrl })
-        await handleImageComplete(record, imageUrl)
+        await handleImageComplete(record, imageUrl, config.baseUrl)
         return
       }
 
@@ -345,7 +345,7 @@ async function processTask(id: number, config: AIConfig) {
 
     if (!isAsync && videoUrl) {
       logTaskProgress(label, 'sync-complete', { id, videoUrl })
-      await handleVideoComplete(record, videoUrl, duration ?? params.duration)
+      await handleVideoComplete(record, videoUrl, duration ?? params.duration, config.baseUrl)
       return
     }
 
@@ -420,7 +420,7 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
         if (type === 'image') {
           if (pollResp.imageUrl) {
             logTaskSuccess(label, 'poll-complete', { id: record.id, taskId, imageUrl: pollResp.imageUrl })
-            await handleImageComplete(record, pollResp.imageUrl)
+            await handleImageComplete(record, pollResp.imageUrl, config.baseUrl)
             return
           }
           if (adapter.provider === 'gemini') {
@@ -434,7 +434,7 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
           }
         } else if (pollResp.videoUrl) {
           logTaskSuccess(label, 'poll-complete', { id: record.id, taskId, videoUrl: pollResp.videoUrl })
-          await handleVideoComplete(record, pollResp.videoUrl, pollResp.duration)
+          await handleVideoComplete(record, pollResp.videoUrl, pollResp.duration, config.baseUrl)
           return
         }
       }
@@ -458,8 +458,8 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
   await failTask(record.id, 'Timeout: polling attempts exhausted')
 }
 
-async function handleImageComplete(record: SysTaskRecord, imageUrl: string) {
-  const localPath = await downloadFile(imageUrl, 'images')
+async function handleImageComplete(record: SysTaskRecord, imageUrl: string, baseUrl?: string | null) {
+  const localPath = await downloadFile(imageUrl, 'images', baseUrl)
   // 列表页缩略图（前端按命名约定推导地址，失败不影响主流程）
   await generateImageThumb(localPath)
 
@@ -541,7 +541,7 @@ async function hasNewerImageTask(record: SysTaskRecord, condition: SQL<unknown>,
   return conflicts
 }
 
-async function handleVideoComplete(record: SysTaskRecord, videoUrl: string, duration: number | null | undefined) {
+async function handleVideoComplete(record: SysTaskRecord, videoUrl: string, duration: number | null | undefined, baseUrl?: string | null) {
   // 先落库地址与实际时长；后续下载失败仍可恢复，且不重新提交生成。
   const params = { ...parseTaskParams(record.params), resultDuration: duration }
   await db.update(schema.sysTask).set({ resultUrl: videoUrl, params: JSON.stringify(params),
@@ -549,7 +549,7 @@ async function handleVideoComplete(record: SysTaskRecord, videoUrl: string, dura
     .where(eq(schema.sysTask.id, record.id))
   try {
     const localPath = record.localPath && fs.existsSync(getAbsolutePath(record.localPath))
-      ? record.localPath : await downloadVideo(videoUrl, record.id)
+      ? record.localPath : await downloadVideo(videoUrl, record.id, { baseUrl })
     await db.update(schema.sysTask).set({ localPath, stage: 'saving', updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
     await extractVideoPoster(localPath)
     // 完成状态与业务回写原子提交；恢复旧任务不能覆盖用户后来生成的视频。
@@ -596,7 +596,7 @@ export async function recoverVideoTask(id: number): Promise<void> {
       stage: record.resultUrl ? 'downloading' : record.stage === 'transferring' || record.errorCode === 'delivery_failed' ? 'transferring' : 'polling', updatedAt: now() }).where(eq(schema.sysTask.id, id))
     void (async () => {
       if (record.resultUrl) {
-        await handleVideoComplete(record, record.resultUrl, parseTaskParams(record.params).resultDuration)
+        await handleVideoComplete(record, record.resultUrl, parseTaskParams(record.params).resultDuration, record.configBaseUrl)
         const [fresh] = await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id))
         if (fresh?.status !== 'failed' || !record.taskId) return
         // 签名链接可能过期：重新查询原任务拿新地址。

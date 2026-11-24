@@ -10,15 +10,33 @@ import { STORAGE_ROOT } from './paths.js'
 /**
  * 下载远程文件到本地存储
  */
-export async function downloadFile(url: string, subDir: string): Promise<string> {
+/**
+ * 相对媒体地址按厂商 Base URL 补全为绝对地址；绝对地址与 data URL 原样返回。
+ * muse2api 等网关在 MUSE2API_PUBLIC_BASE 未设置时只返回相对地址（如 /v1/media/x.webp），
+ * 直接 fetch 会抛 "Failed to parse URL from ..." —— 补全后再下载。
+ */
+export function resolveMediaUrl(url: string, baseUrl?: string | null): string {
+  const raw = String(url || '').trim()
+  if (!raw) return raw
+  if (/^https?:\/\//i.test(raw) || raw.startsWith('data:')) return raw
+  if (!baseUrl) return raw
+  try {
+    return new URL(raw, baseUrl).toString()
+  } catch {
+    return raw
+  }
+}
+
+export async function downloadFile(url: string, subDir: string, baseUrl?: string | null): Promise<string> {
+  const absoluteUrl = resolveMediaUrl(url, baseUrl)
   const dir = path.join(STORAGE_ROOT, subDir)
   fs.mkdirSync(dir, { recursive: true })
 
-  const ext = getExtFromUrl(url)
+  const ext = getExtFromUrl(absoluteUrl)
   const filename = `${uuid()}${ext}`
   const filePath = path.join(dir, filename)
 
-  const resp = await fetch(url)
+  const resp = await fetch(absoluteUrl)
   if (!resp.ok) throw new Error(`Download failed: ${resp.status}`)
 
   const buffer = Buffer.from(await resp.arrayBuffer())

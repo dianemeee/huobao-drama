@@ -3,6 +3,7 @@ import path from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { STORAGE_ROOT } from '../utils/paths.js'
+import { resolveMediaUrl } from '../utils/storage.js'
 
 export class VideoDownloadError extends Error {
   constructor(public code: string, message: string, public retryable = false) { super(message) }
@@ -20,8 +21,10 @@ export function safeTaskError(error: unknown): string {
 
 /** 下载到临时文件，校验容器头后原子改名；同任务重复恢复不会新增媒体文件。 */
 export async function downloadVideo(url: string, taskId: number, options: {
-  root?: string; attempts?: number; timeoutMs?: number; retryDelayMs?: number; maxBytes?: number
+  root?: string; baseUrl?: string | null; attempts?: number; timeoutMs?: number; retryDelayMs?: number; maxBytes?: number
 } = {}): Promise<string> {
+  // 相对地址（如网关返回的 /v1/media/x.mp4）按厂商 Base URL 补全，否则 new URL 直接抛错。
+  url = resolveMediaUrl(url, options.baseUrl)
   const parsed = new URL(url)
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new VideoDownloadError('download_url', 'Invalid video URL protocol')
   const root = options.root ?? STORAGE_ROOT
