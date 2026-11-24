@@ -7,6 +7,7 @@ import { safeTaskError } from '../services/video-download.js'
 import { getActiveConfig, getConfigById } from '../services/ai.js'
 import { getDramaStylePrompt } from '../services/style-preset.js'
 import { resolveStoryboardVoiceReferences } from '../services/character-voice-references.js'
+import { splitStoryboardIfTooLong } from '../services/video-split.js'
 import { logTaskError, logTaskPayload, logTaskStart, logTaskSuccess } from '../utils/task-logger.js'
 
 const app = new Hono()
@@ -161,6 +162,8 @@ app.post('/', async (c) => {
       }
     }
 
+    // 超长分镜的拆段结果（未拆时为 null）；在生成调用处逐段建任务
+    let videoSplit: Awaited<ReturnType<typeof splitStoryboardIfTooLong>> | null = null
     if (type === 'video' && videoBody) {
       const effectiveConfig = configId
         ? (await getConfigById(configId)) ?? await getActiveConfig('video')
@@ -173,6 +176,10 @@ app.post('/', async (c) => {
       if (voices.hasVoiceReferences && videoBody.generate_audio === false) return badRequest(c, '引用角色音色时需要开启视频声音')
       const referenceError = validateVideoRequest(videoBody, effectiveConfig?.provider)
       if (referenceError) return badRequest(c, referenceError)
+      // 分镜超过该厂商单段上限：先拆成多段连续镜头（同首帧、台词按段切分），再逐段生成
+      if (body.storyboard_id) {
+        videoSplit = await splitStoryboardIfTooLong(db, Number(body.storyboard_id), effectiveConfig?.provider, videoBody.prompt, videoBody.duration)
+      }
     }
 
     logTaskStart('TaskAPI', 'generate', {
@@ -184,16 +191,20 @@ app.post('/', async (c) => {
     })
     logTaskPayload('TaskAPI', 'request body', body)
 
-    // 视频生成时把项目视觉风格词注入提示词最前方（与图片侧的自动注入保持一致口径）
-    let videoPrompt = videoBody?.prompt
-    if (type === 'video' && String(videoPrompt || '').trim()) {
-      const dramaId = body.drama_id ?? storyboardDramaId ?? null
-      const stylePrompt = await getDramaStylePrompt(dramaId)
-      if (stylePrompt) videoPrompt = `${stylePrompt}，\n${videoPrompt}`
+    // 视频生成时把项目视觉风格词注入提示词最前方（与图片侧的自动注入保持一致口径）；
+    // 拆段的分镜：风格词注入每一段的提示词最前方
+    const stylePrompt = type === 'video'
+      ? await getDramaStylePrompt(body.drama_id ?? storyboardDramaId ?? null)
+      : null
+    const withStyle = (p?: string | null) => {
+      const text = String(p || '').trim()
+      if (!text) return text
+      return stylePrompt ? `${stylePrompt}，\n${text}` : text
     }
 
-    const id = type === 'image'
-      ? await generateImage({
+    let id = 0
+    if (type === 'image') {
+      id = await generateImage({
         storyboardId: body.storyboard_id,
         dramaId: body.drama_id,
         sceneId: body.scene_id,
@@ -205,11 +216,10 @@ app.post('/', async (c) => {
         frameType: body.frame_type,
         configId,
       })
-      : await generateVideo({
+    } else {
+      const videoParams = {
         forceNew: body.force_new === true,
-        storyboardId: body.storyboard_id,
         dramaId: body.drama_id,
-        prompt: videoPrompt,
         model: videoBody!.model,
         referenceMode: 'reference',
         imageUrl: videoBody!.image_url,
@@ -221,14 +231,30 @@ app.post('/', async (c) => {
         referenceFileUrl: videoBody!.file_url,
         referenceLinkUrl: videoBody!.link_url,
         generateAudio: videoBody!.generate_audio,
-        duration: videoBody!.duration,
         aspectRatio: videoBody!.aspect_ratio,
         resolution: episodeResolution || videoBody!.resolution,
         seed: videoBody!.seed,
         promptExtend: videoBody!.prompt_extend,
         watermark: videoBody!.watermark,
         configId,
-      })
+      }
+      // 超长分镜已拆成多段：每段一个任务，同首帧、同参考素材；返回首段任务 id
+      const videoJobs = videoSplit?.split
+        ? videoSplit.chunks.map((chunk) => ({
+          storyboardId: chunk.storyboardId,
+          prompt: withStyle(chunk.prompt),
+          duration: chunk.durationSeconds,
+        }))
+        : [{
+          storyboardId: body.storyboard_id,
+          prompt: withStyle(videoBody?.prompt),
+          duration: videoBody!.duration,
+        }]
+      for (const job of videoJobs) {
+        const taskId = await generateVideo({ ...videoParams, ...job })
+        if (!id) id = taskId
+      }
+    }
 
     const [record] = await db.select().from(schema.sysTask)
       .where(eq(schema.sysTask.id, id))

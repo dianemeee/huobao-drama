@@ -6,7 +6,8 @@ import { eq } from 'drizzle-orm'
 import { db, schema } from '../db/index.js'
 import { mastra } from '../mastra/index.js'
 import { buildAgentRequestContext } from '../agents/context.js'
-import { logTaskError, logTaskProgress, logTaskStart, logTaskSuccess } from '../utils/task-logger.js'
+import { splitStoryboardIfTooLong } from './video-split.js'
+import { logTaskError, logTaskProgress, logTaskStart, logTaskSuccess, logTaskWarn } from '../utils/task-logger.js'
 
 export interface VideoPromptBatchStatus {
   status: 'running' | 'done' | 'error'
@@ -42,9 +43,13 @@ export async function startVideoPromptBatch(
   // 视频模型标签：跟随该集锁定的视频配置，供 Agent 按模型特性生成
   const [ep] = await db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId))
   let videoLabel = '默认'
+  let videoProvider: string | undefined
   if (ep?.videoConfigId) {
     const [cfg] = await db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, ep.videoConfigId))
-    if (cfg) videoLabel = `${cfg.name} (${cfg.provider})`
+    if (cfg) {
+      videoLabel = `${cfg.name} (${cfg.provider})`
+      videoProvider = cfg.provider ?? undefined
+    }
   }
 
   const task: VideoPromptBatchStatus = {
@@ -77,8 +82,18 @@ export async function startVideoPromptBatch(
         }], { maxSteps: 8, requestContext })
         // 以实际落库为准判定成败
         const [fresh] = await db.select().from(schema.storyboards).where(eq(schema.storyboards.id, sb.id))
-        if ((fresh?.videoPrompt || '').trim()) task.completed++
-        else {
+        if ((fresh?.videoPrompt || '').trim()) {
+          task.completed++
+          // 分镜超过该厂商单段上限：提示词写好后立刻拆成多段连续镜头，
+          // 界面上直接看到分段，生成视频时按段建任务
+          if (videoProvider) {
+            try {
+              await splitStoryboardIfTooLong(db, sb.id, videoProvider)
+            } catch (err: any) {
+              logTaskWarn('VideoPrompt', 'split-long-shot', { storyboardId: sb.id, error: err?.message })
+            }
+          }
+        } else {
           task.failed++
           logTaskError('VideoPrompt', 'batch-shot', { storyboardId: sb.id, error: 'agent finished but video_prompt is empty' })
         }
