@@ -4,6 +4,7 @@ import { db, getInsertId, schema } from '../db/index.js'
 import { success, created, now, badRequest } from '../utils/response.js'
 import { toSnakeCase } from '../utils/transform.js'
 import { logTaskPayload, logTaskStart, logTaskSuccess } from '../utils/task-logger.js'
+import { autoBindEpisode } from '../services/auto-bind.js'
 
 const app = new Hono()
 
@@ -112,6 +113,27 @@ app.post('/', async (c) => {
     character_ids: await getStoryboardCharacterIds(result.id),
     prop_ids: await getStoryboardPropIds(result.id),
   })
+})
+
+// POST /storyboards/auto-bind — one-click AI auto-bind of reference assets.
+// Uses the episode's active text model (qwen via OpenRouter in the default
+// setup) to match characters / scenes / props to every shot, then saves the
+// bindings through the same link tables the manual panel uses.
+app.post('/auto-bind', async (c) => {
+  const body = await c.req.json()
+  const episodeId = Number(body.episode_id)
+  if (!episodeId) return badRequest(c, 'episode_id is required')
+  logTaskStart('StoryboardAPI', 'auto-bind', {
+    episodeId,
+    storyboardIds: body.storyboard_ids,
+  })
+  const summary = await autoBindEpisode(episodeId, body.storyboard_ids)
+  logTaskSuccess('StoryboardAPI', 'auto-bind', {
+    episodeId,
+    bound: summary.bound_shots,
+    total: summary.total_shots,
+  })
+  return success(c, summary)
 })
 
 // PUT /storyboards/:id

@@ -62,6 +62,7 @@ export const storyboardAPI = {
   create: (data: any) => api.post('/storyboards', data),
   update: (id: number, data: any) => api.put(`/storyboards/${id}`, data),
   del: (id: number) => api.del(`/storyboards/${id}`),
+  autoBind: (episodeId: number, storyboardIds?: number[]) => api.post('/storyboards/auto-bind', { episode_id: episodeId, storyboard_ids: storyboardIds?.length ? storyboardIds : undefined }),
 }
 
 export const characterAPI = {
